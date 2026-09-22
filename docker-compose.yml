@@ -1,0 +1,63 @@
+services:
+  source:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: source
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=4
+      -c max_wal_senders=4
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./db/init-source.sql:/docker-entrypoint-initdb.d/init-source.sql:ro
+
+  dest:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: dest
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./db/init-dest.sql:/docker-entrypoint-initdb.d/init-dest.sql:ro
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  # Minimal CDC capture service. In tests this is usually started inline so
+  # failpoints can be controlled, but the compose file defines the complete
+  # environment.
+  capture:
+    build: .
+    command: ["/app/seam-capture"]
+    depends_on:
+      - source
+      - kafka
+    environment:
+      SOURCE_SQL_DSN: postgres://postgres:postgres@source:5432/source?sslmode=disable
+      SOURCE_REPLICATION_DSN: postgres://postgres:postgres@source:5432/source?sslmode=disable&replication=database
+      SEAM_SOURCE_SLOT: seam_slot
+      SEAM_SOURCE_PUBLICATION: seam_pub
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: seam.accounts
+      SEAM_GENERATION: gen:0

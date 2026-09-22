@@ -1,0 +1,263 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"testing"
+	"time"
+
+	"example.com/seam/internal/capture"
+	"example.com/seam/internal/checkpoint"
+	"example.com/seam/internal/failpoint"
+	"example.com/seam/internal/kafka"
+	"example.com/seam/internal/marker"
+	"example.com/seam/internal/model"
+	"example.com/seam/internal/reconcile"
+	"example.com/seam/internal/scan"
+	"example.com/seam/internal/sink"
+	"example.com/seam/integration/itest"
+)
+
+// TestPhase7_SourceReplayDedupe proves that replaying already-applied Kafka
+// records does not corrupt the destination because seam_applied_txs dedupes by
+// source LSN.
+func TestPhase7_SourceReplayDedupe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	if err := itest.ResetTables(ctx); err != nil {
+		t.Fatalf("reset tables: %v", err)
+	}
+
+	src, err := itest.SourceConn(ctx)
+	if err != nil {
+		t.Fatalf("source conn: %v", err)
+	}
+	for i := int64(1); i <= 5; i++ {
+		if _, err := src.Exec(ctx,
+			`INSERT INTO accounts (id, owner, balance_cents) VALUES ($1, $2, $3)`,
+			i, fmt.Sprintf("owner-%d", i), i*100); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+
+	// Apply a concurrent update so there is CDC to replay.
+	if _, err := src.Exec(ctx, `UPDATE accounts SET balance_cents = 9999 WHERE id = 1`); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	src.Close(context.Background())
+
+	readerCfg := capture.ReaderConfig{
+		SQLDSN:         itest.SourceDSN(),
+		ReplicationDSN: itest.SourceReplDSN(),
+		Slot:           "seam_itest_slot",
+		Publication:    "seam_pub",
+		KafkaBrokers:   itest.KafkaBrokers(),
+		KafkaTopic:     itest.KafkaTopic(),
+		Generation:     "gen:0",
+	}
+	reader, err := capture.StartReader(ctx, readerCfg)
+	if err != nil {
+		t.Fatalf("start capture reader: %v", err)
+	}
+	defer reader.Close()
+
+	recCtx, recCancel := context.WithCancel(ctx)
+	capErr := make(chan error, 1)
+	go func() {
+		if err := reader.Run(recCtx); err != nil && !errors.Is(err, context.Canceled) {
+			capErr <- err
+		}
+		close(capErr)
+	}()
+	defer func() {
+		_ = reader.Close()
+		select {
+		case err := <-capErr:
+			if err != nil {
+				t.Errorf("capture reader error: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("capture reader did not stop")
+		}
+	}()
+
+	jobCfg := model.JobConfig{
+		JobID:             "phase7",
+		SourceDSN:         itest.SourceDSN(),
+		SourceReplDSN:     itest.SourceReplDSN(),
+		SourceSlot:        "seam_itest_slot",
+		SourcePublication: "seam_pub",
+		DestDSN:           itest.DestDSN(),
+		KafkaBrokers:      itest.KafkaBrokers(),
+		KafkaTopic:        itest.KafkaTopic(),
+		ChunkSize:         10,
+	}
+	cpStore := checkpoint.NewStore(itest.DestDSN())
+	if err := cpStore.EnsureTables(ctx); err != nil {
+		t.Fatalf("ensure tables: %v", err)
+	}
+	upperBound, err := scan.NewChunkReader(itest.SourceDSN()).UpperBound(ctx)
+	if err != nil {
+		t.Fatalf("upper bound: %v", err)
+	}
+	cp, err := cpStore.CreateJob(ctx, jobCfg, upperBound)
+	if err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	consumer, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), cp.NextKafkaOffset, func(data []byte) (model.Change, error) {
+		var codec capture.JSONCodec
+		return codec.Decode(data)
+	})
+	if err != nil {
+		t.Fatalf("create consumer: %v", err)
+	}
+	defer consumer.Close()
+
+	fp := failpoint.NewRegistry()
+	rec := reconcile.New(reconcile.Config{
+		JobConfig:       jobCfg,
+		Checkpoint:      cp,
+		Consumer:        consumer,
+		CheckpointStore: cpStore,
+		MarkerStore:     marker.NewStore(itest.SourceDSN()),
+		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
+		Sink:            sink.NewMutator(),
+		Failpoints:      fp,
+	})
+
+	recErr := make(chan error, 1)
+	go func() {
+		recErr <- rec.Run(recCtx)
+	}()
+
+	// Wait for backfill to complete.
+	dst, err := itest.DestConn(ctx)
+	if err != nil {
+		t.Fatalf("dest conn: %v", err)
+	}
+	defer dst.Close(context.Background())
+
+	var completed int64 = math.MinInt64
+	for i := 0; i < 60; i++ {
+		if err := dst.QueryRow(ctx, `SELECT completed_through_id FROM seam_checkpoints WHERE job_id = $1`, jobCfg.JobID).Scan(&completed); err != nil {
+			t.Fatalf("read checkpoint: %v", err)
+		}
+		if completed >= upperBound {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if completed < upperBound {
+		t.Fatalf("backfill did not complete: completed_through=%d upper_bound=%d", completed, upperBound)
+	}
+
+	var balanceBefore int64
+	if err := dst.QueryRow(ctx, `SELECT balance_cents FROM accounts WHERE id = 1`).Scan(&balanceBefore); err != nil {
+		t.Fatalf("read balance before replay: %v", err)
+	}
+	if balanceBefore != 9999 {
+		t.Fatalf("expected balance 9999 before replay, got %d", balanceBefore)
+	}
+
+	var appliedBefore int
+	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM seam_applied_txs WHERE job_id = $1`, jobCfg.JobID).Scan(&appliedBefore); err != nil {
+		t.Fatalf("count applied txs before replay: %v", err)
+	}
+
+	recCancel()
+	select {
+	case err := <-recErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("reconciler error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconciler did not stop")
+	}
+
+	// Replay from offset 0 with a fresh consumer and reconciler.
+	cp, err = cpStore.LoadCheckpoint(ctx, jobCfg.JobID)
+	if err != nil {
+		t.Fatalf("load checkpoint: %v", err)
+	}
+	replayCtx, replayCancel := context.WithCancel(ctx)
+	defer replayCancel()
+
+	replayConsumer, err := kafka.NewConsumer(itest.KafkaBrokers(), itest.KafkaTopic(), 0, func(data []byte) (model.Change, error) {
+		var codec capture.JSONCodec
+		return codec.Decode(data)
+	})
+	if err != nil {
+		t.Fatalf("create replay consumer: %v", err)
+	}
+	defer replayConsumer.Close()
+
+	replayRec := reconcile.New(reconcile.Config{
+		JobConfig:       jobCfg,
+		Checkpoint:      cp,
+		Consumer:        replayConsumer,
+		CheckpointStore: cpStore,
+		MarkerStore:     marker.NewStore(itest.SourceDSN()),
+		Scanner:         scan.NewChunkReader(itest.SourceDSN()),
+		Sink:            sink.NewMutator(),
+	})
+
+	replayErr := make(chan error, 1)
+	go func() {
+		replayErr <- replayRec.Run(replayCtx)
+	}()
+
+	// Let it replay and catch up to the previous offset.
+	for i := 0; i < 60; i++ {
+		var offset int64
+		if err := dst.QueryRow(ctx, `SELECT next_kafka_offset FROM seam_checkpoints WHERE job_id = $1`, jobCfg.JobID).Scan(&offset); err != nil {
+			t.Fatalf("read checkpoint during replay: %v", err)
+		}
+		if offset >= cp.NextKafkaOffset {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	var balanceAfter int64
+	if err := dst.QueryRow(ctx, `SELECT balance_cents FROM accounts WHERE id = 1`).Scan(&balanceAfter); err != nil {
+		t.Fatalf("read balance after replay: %v", err)
+	}
+	if balanceAfter != 9999 {
+		t.Fatalf("expected balance 9999 after replay, got %d", balanceAfter)
+	}
+
+	var appliedAfter int
+	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM seam_applied_txs WHERE job_id = $1`, jobCfg.JobID).Scan(&appliedAfter); err != nil {
+		t.Fatalf("count applied txs after replay: %v", err)
+	}
+	if appliedAfter != appliedBefore {
+		t.Fatalf("expected applied_txs count unchanged (%d), got %d", appliedBefore, appliedAfter)
+	}
+
+	// Destination row count should still be exactly 5.
+	var rowCount int
+	if err := dst.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&rowCount); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rowCount != 5 {
+		t.Fatalf("expected 5 destination rows, got %d", rowCount)
+	}
+
+	replayCancel()
+	select {
+	case err := <-replayErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("replay reconciler error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("replay reconciler did not stop")
+	}
+
+	fmt.Println("Phase 7 source replay dedupe verified")
+}
